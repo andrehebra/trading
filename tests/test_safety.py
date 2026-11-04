@@ -2,7 +2,7 @@ import os
 os.environ.setdefault("APP_MASTER_KEY", "h4c9CJZZy_4FMBz9cU1EpuEwPYUUnva7grXAUDFJIpY=")
 os.environ.setdefault("DATABASE_PATH", "/tmp/prediction-market-test.db")
 
-from app.main import fee, normalize_market
+from app.main import fast_kalshi_crypto, fee, normalize_market
 
 
 def test_polymarket_crypto_taker_fee_formula():
@@ -14,3 +14,10 @@ def test_kalshi_prices_are_normalized_from_cents():
     market = normalize_market("kalshi", {"ticker": "KXBTC", "title": "Bitcoin", "yes_bid": 42, "yes_ask": 45})
     assert market["yes_bid"] == 0.42
     assert market["yes_ask"] == 0.45
+
+
+def test_fast_kalshi_filter_only_accepts_15_minute_crypto_series():
+    assert fast_kalshi_crypto({"ticker": "KXBTC15M-26NOV031200-00"})
+    assert fast_kalshi_crypto({"series_ticker": "KXSOL15M"})
+    assert not fast_kalshi_crypto({"ticker": "KXPRESPARTY-27NOV03"})
+    assert not fast_kalshi_crypto({"ticker": "KXSOL-27NOV03"})

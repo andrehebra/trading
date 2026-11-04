@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -32,6 +33,13 @@ KALSHI = {
 }
 POLYMARKET_US = "https://api.polymarket.us"
 CRYPTO_TERMS = ("bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "dogecoin", "doge", "xrp")
+FAST_KALSHI_SERIES = {
+    "KXBTC15M": "Bitcoin",
+    "KXETH15M": "Ethereum",
+    "KXSOL15M": "Solana",
+    "KXXRP15M": "XRP",
+    "KXDOGE15M": "Dogecoin",
+}
 
 
 def utc_now() -> str:
@@ -160,9 +168,15 @@ class ArmRequest(BaseModel):
 
 def normalize_market(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
     if provider == "kalshi":
+        ticker = raw.get("ticker", "")
+        series = raw.get("series_ticker", "")
+        label = raw.get("title") or raw.get("subtitle") or ticker
+        if series in FAST_KALSHI_SERIES or any(ticker.startswith(value) for value in FAST_KALSHI_SERIES):
+            asset = FAST_KALSHI_SERIES.get(series) or next(name for key, name in FAST_KALSHI_SERIES.items() if ticker.startswith(key))
+            label = f"{asset} — Up or Down · 15-minute window"
         return {
-            "provider": provider, "id": raw.get("ticker", ""), "event_id": raw.get("event_ticker", ""),
-            "title": raw.get("title") or raw.get("subtitle") or raw.get("ticker", ""),
+            "provider": provider, "id": ticker, "event_id": raw.get("event_ticker", ""),
+            "title": label,
             "close_time": raw.get("close_time") or raw.get("expiration_time"),
             "yes_bid": cents(raw.get("yes_bid") or raw.get("yes_bid_dollars")),
             "yes_ask": cents(raw.get("yes_ask") or raw.get("yes_ask_dollars")), "raw": raw,
@@ -194,10 +208,17 @@ class KalshiAdapter:
 
     async def markets(self, environment: str) -> list[dict[str, Any]]:
         async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.get(f"{KALSHI[environment]}/markets", params={"status": "open", "limit": 200})
-            response.raise_for_status()
-        values = response.json().get("markets", [])
-        return [normalize_market(self.provider, v) for v in values if crypto(v)]
+            requests = [client.get(f"{KALSHI[environment]}/markets", params={"status": "open", "limit": 20, "series_ticker": series}) for series in FAST_KALSHI_SERIES]
+            responses = await asyncio.gather(*requests)
+            for response in responses:
+                response.raise_for_status()
+        values = [market for response in responses for market in response.json().get("markets", [])]
+        # Direct series requests are authoritative. The guard also handles an API response
+        # that omits series_ticker while retaining its complete market ticker.
+        return sorted(
+            [normalize_market(self.provider, value) for value in values if fast_kalshi_crypto(value)],
+            key=lambda market: market.get("close_time") or "",
+        )
 
     async def book(self, market_id: str, environment: str, credentials: dict[str, str] | None = None) -> dict[str, Any]:
         headers = self._headers("GET", f"/trade-api/v2/markets/{market_id}/orderbook", credentials) if credentials else {}
@@ -277,8 +298,17 @@ class PolymarketUSAdapter:
 
 
 def crypto(value: dict[str, Any]) -> bool:
-    text = " ".join(str(value.get(k, "")) for k in ("title", "subtitle", "ticker", "category", "tags")).lower()
-    return any(term in text for term in CRYPTO_TERMS)
+    ticker = str(value.get("ticker") or value.get("slug") or "").upper()
+    if fast_kalshi_crypto(value):
+        return True
+    text = " ".join(str(value.get(k, "")) for k in ("title", "subtitle", "category", "tags")).lower()
+    return bool(re.search(r"\b(bitcoin|btc|ethereum|eth|cryptocurrency|crypto|solana|dogecoin|doge|xrp)\b", text)) or bool(re.search(r"(?:^|[-_])(btc|eth|sol|xrp|doge)(?:[-_]|$)", ticker.lower()))
+
+
+def fast_kalshi_crypto(value: dict[str, Any]) -> bool:
+    ticker = str(value.get("ticker", "")).upper()
+    series = str(value.get("series_ticker", "")).upper()
+    return series in FAST_KALSHI_SERIES or any(ticker.startswith(prefix + "-") for prefix in FAST_KALSHI_SERIES)
 
 
 def adapter(provider: str):

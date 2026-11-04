@@ -1,6 +1,6 @@
 # Market Guard — self-hosted prediction-market bot
 
-Market Guard is a paper-first crypto prediction-market trading dashboard for **Kalshi** and **Polymarket US**. It discovers open crypto markets, shows order books, persists orders and fills in SQLite, and can automate a capped YES-entry strategy. It is designed as a small, inspectable deployment—not investment advice or a promise of profitability.
+Market Guard is a paper-first crypto prediction-market trading dashboard for **Kalshi** and **Polymarket US**. For Kalshi, discovery is intentionally focused on active 15-minute Up/Down crypto windows: Bitcoin, Ethereum, Solana, XRP, and Dogecoin. It shows order books, persists orders and fills in SQLite, and can automate a capped YES-entry strategy. It is designed as a small, inspectable deployment—not investment advice or a promise of profitability.
 
 ## Safety posture
 
