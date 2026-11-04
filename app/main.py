@@ -27,6 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("market-bot")
 DATA = Path(os.getenv("DATABASE_PATH", "data/trader.db"))
 POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "15")))
+ORDER_TTL_SECONDS = min(300, max(10, int(os.getenv("ORDER_TTL_SECONDS", "10"))))
 KALSHI = {
     "demo": "https://demo-api.kalshi.co/trade-api/v2",
     "live": "https://api.elections.kalshi.com/trade-api/v2",
@@ -305,7 +306,7 @@ class KalshiAdapter:
 
     async def order(self, market: dict[str, Any], outcome: Literal["YES", "NO"], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
         path = "/trade-api/v2/portfolio/events/orders"
-        body = kalshi_order_body(market["id"], outcome, price, quantity, client_order_id, maker_only)
+        body = kalshi_order_body(market["id"], outcome, price, quantity, client_order_id, maker_only, int(time.time()) + ORDER_TTL_SECONDS)
         headers = self._headers("POST", path, credentials)
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(KALSHI[environment] + "/portfolio/events/orders", headers=headers, json=body)
@@ -331,6 +332,14 @@ class KalshiAdapter:
             response.raise_for_status()
         payload = response.json()
         return payload.get("market_positions", payload.get("positions", []))
+
+    async def cancel_order(self, order_id: str, market_id: str, credentials: dict[str, str], environment: str) -> None:
+        """Cancel a still-resting V2 order, routing it to its market's exchange shard."""
+        path = f"/trade-api/v2/portfolio/events/orders/{order_id}"
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.delete(KALSHI[environment] + f"/portfolio/events/orders/{order_id}",
+                                           params={"market_ticker": market_id}, headers=self._headers("DELETE", path, credentials))
+            response.raise_for_status()
 
     @staticmethod
     def _headers(method: str, path: str, credentials: dict[str, str] | None) -> dict[str, str]:
@@ -429,16 +438,19 @@ def fast_kalshi_directional(value: dict[str, Any]) -> bool:
     return series in DIRECTIONAL_KALSHI_SERIES or any(ticker.startswith(prefix + "-") for prefix in DIRECTIONAL_KALSHI_SERIES)
 
 
-def kalshi_order_body(market_id: str, outcome: Literal["YES", "NO"], price: float, quantity: int, client_order_id: str, maker_only: bool = False) -> dict[str, Any]:
+def kalshi_order_body(market_id: str, outcome: Literal["YES", "NO"], price: float, quantity: int, client_order_id: str, maker_only: bool = False, expiration_time: int | None = None) -> dict[str, Any]:
     """Translate an intended YES/NO purchase into Kalshi's complementary contract API."""
     # Kalshi's order API buys YES with a bid. A long NO is represented by selling
     # the complementary YES contract, at (1 - NO price), rather than an inverted
     # YES bid. Store and display the user's intended NO price everywhere else.
     side = "bid" if outcome == "YES" else "ask"
     venue_price = price if outcome == "YES" else round(1 - price, 4)
-    return {"ticker": market_id, "client_order_id": client_order_id, "side": side, "count": f"{quantity:.2f}",
+    body = {"ticker": market_id, "client_order_id": client_order_id, "side": side, "count": f"{quantity:.2f}",
             "price": f"{venue_price:.4f}", "time_in_force": "good_till_canceled", "post_only": maker_only,
             "self_trade_prevention_type": "taker_at_cross"}
+    if expiration_time is not None:
+        body["expiration_time"] = expiration_time
+    return body
 
 
 def adapter(provider: str):
@@ -546,7 +558,7 @@ async def reconcile_kalshi_orders(cfg: dict[str, Any]) -> None:
         event("warning", "reconciliation_skipped", "Kalshi credentials unavailable")
         return
     with db() as c:
-        rows = [dict(row) for row in c.execute("""SELECT id,exchange_order_id,status,market_id
+        rows = [dict(row) for row in c.execute("""SELECT id,exchange_order_id,status,market_id,created_at
             FROM orders WHERE provider='kalshi' AND mode='live' AND status IN ('open','filled')
             AND exchange_order_id IS NOT NULL""").fetchall()]
     if not rows:
@@ -557,6 +569,12 @@ async def reconcile_kalshi_orders(cfg: dict[str, Any]) -> None:
         try:
             exchange_order = await venue.order_state(row["exchange_order_id"], credentials, cfg["environment"])
             state = str(exchange_order.get("status", "")).lower()
+            if state == "resting" and order_age_seconds(row["created_at"]) >= ORDER_TTL_SECONDS:
+                await venue.cancel_order(row["exchange_order_id"], row["market_id"], credentials, cfg["environment"])
+                with db() as c:
+                    c.execute("UPDATE orders SET status='cancelled',updated_at=? WHERE id=?", (utc_now(), row["id"]))
+                event("info", "order_ttl_cancelled", f"{row['market_id']} cancelled after {ORDER_TTL_SECONDS}s unfilled")
+                continue
             next_status = terminal.get(state, "open" if state in {"resting", "pending"} else None)
             if next_status and next_status != row["status"]:
                 with db() as c:
@@ -582,6 +600,14 @@ async def reconcile_kalshi_orders(cfg: dict[str, Any]) -> None:
                 event("info", "position_reconciled", f"{row['market_id']} no longer open at Kalshi")
     except Exception as exc:
         event("warning", "position_reconciliation_error", type(exc).__name__)
+
+
+def order_age_seconds(created_at: str) -> float:
+    try:
+        return max(0.0, (datetime.now(UTC) - datetime.fromisoformat(created_at)).total_seconds())
+    except (TypeError, ValueError):
+        # A malformed timestamp must never cause an early cancel.
+        return 0.0
 
 
 async def worker() -> None:

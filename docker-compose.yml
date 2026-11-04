@@ -7,6 +7,7 @@ services:
       APP_MASTER_KEY: ${APP_MASTER_KEY:?Set APP_MASTER_KEY in .env before starting}
       DATABASE_PATH: /app/data/trader.db
       POLL_SECONDS: ${POLL_SECONDS:-15}
+      ORDER_TTL_SECONDS: ${ORDER_TTL_SECONDS:-10}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

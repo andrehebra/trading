@@ -9,6 +9,7 @@ Market Guard is a paper-first prediction-market trading dashboard for **Kalshi**
 - Every decision is persisted before any order attempt. A provider/market/**outcome**/mode record with an `open` or `filled` status blocks a duplicate after a restart, while allowing an independently eligible YES and NO position.
 - Dollar sizing, daily and lifetime allocated-spend caps, and maximum open exposure are checked before submission. Limit price is always capped.
 - The worker stops on the kill switch and catches data/API failures without trading. It only acts on prices fetched in the current polling pass—there is no stale cached-price execution.
+- Automated Kalshi orders include an exchange-side expiration timestamp of 10 seconds. The worker also reconciles resting, canceled, executed, and settled orders before it reuses reserved risk capacity.
 - “Maker-only” prices one tick below the displayed ask and will not submit a buy that meets or exceeds that ask. Polymarket US additionally receives its documented `participateDontInitiate` flag. In live mode the limit order uses GTC; confirm each venue’s current post-only semantics before enabling it.
 
 The kill switch halts new automated orders immediately and disarms live mode. It intentionally does **not** blindly cancel existing live exchange orders, so a network/API mismatch cannot turn an emergency stop into an unexpected cancellation. Inspect and cancel them in the venue or extend the reviewed adapter cancellation path for your operating policy.
@@ -44,6 +45,8 @@ docker compose down
 ```
 
 Persistent encrypted credentials, orders, fills, and audit logs live in `./data/trader.db`. Back it up together with the `APP_MASTER_KEY`; neither can recover the credentials without the other.
+
+`ORDER_TTL_SECONDS=10` is passed through Docker Compose and is clamped to a minimum of 10 seconds. It applies an exchange-side expiry to each new automated Kalshi order, so an unfilled order cannot survive a bot restart or a delayed polling pass. Existing orders are also canceled by the reconciliation loop once they are confirmed resting beyond the configured interval.
 
 ## Exchange integration notes (verified 2026-11-03)
 

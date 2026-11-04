@@ -7,7 +7,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 os.environ.setdefault("APP_MASTER_KEY", "h4c9CJZZy_4FMBz9cU1EpuEwPYUUnva7grXAUDFJIpY=")
 os.environ.setdefault("DATABASE_PATH", "/tmp/prediction-market-test.db")
 
-from app.main import KalshiAdapter, fast_kalshi_crypto, fast_kalshi_directional, fee, in_entry_band, kalshi_order_body, migrate_orders_schema, normalize_market
+from app.main import KalshiAdapter, fast_kalshi_crypto, fast_kalshi_directional, fee, in_entry_band, kalshi_order_body, migrate_orders_schema, normalize_market, order_age_seconds
 
 
 def test_polymarket_crypto_taker_fee_formula():
@@ -37,12 +37,13 @@ def test_directional_filter_adds_exact_15_minute_commodity_series_only():
 
 
 def test_kalshi_no_order_uses_complementary_yes_ask():
-    body = kalshi_order_body("KXGOLD15M-test", "NO", 0.96, 1, "unique-order", maker_only=True)
+    body = kalshi_order_body("KXGOLD15M-test", "NO", 0.96, 1, "unique-order", maker_only=True, expiration_time=1234567890)
     assert body["side"] == "ask"
     assert body["price"] == "0.0400"
     assert body["ticker"] == "KXGOLD15M-test"
     assert body["count"] == "1.00"
     assert body["post_only"] is True
+    assert body["expiration_time"] == 1234567890
 
 
 def test_kalshi_key_error_is_actionable_and_secret_free():
@@ -81,3 +82,7 @@ def test_entry_band_includes_exact_bounds_only():
     assert in_entry_band(0.90, 0.90, 0.98)
     assert in_entry_band(0.98, 0.90, 0.98)
     assert not in_entry_band(0.981, 0.90, 0.98)
+
+
+def test_order_age_refuses_to_cancel_unparseable_timestamp():
+    assert order_age_seconds("not-a-timestamp") == 0
