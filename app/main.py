@@ -221,9 +221,17 @@ class KalshiAdapter:
         )
 
     async def book(self, market_id: str, environment: str, credentials: dict[str, str] | None = None) -> dict[str, Any]:
-        headers = self._headers("GET", f"/trade-api/v2/markets/{market_id}/orderbook", credentials) if credentials else {}
+        path = f"/trade-api/v2/markets/{market_id}/orderbook"
+        url = f"{KALSHI[environment]}/markets/{market_id}/orderbook"
         async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.get(f"{KALSHI[environment]}/markets/{market_id}/orderbook", headers=headers)
+            # Some Kalshi book routes are public. Avoid parsing/signing a credential unless
+            # the exchange explicitly asks for it, which also makes public discovery work
+            # before a user has supplied a private key.
+            response = await client.get(url)
+            if response.status_code in (401, 403):
+                if not credentials:
+                    raise PermissionError("Kalshi requires a production API key and its matching private-key PEM to view this order book")
+                response = await client.get(url, headers=self._headers("GET", path, credentials))
             response.raise_for_status()
             return response.json().get("orderbook", response.json())
 
@@ -241,10 +249,19 @@ class KalshiAdapter:
     def _headers(method: str, path: str, credentials: dict[str, str] | None) -> dict[str, str]:
         if not credentials:
             return {}
+        key_id = credentials.get("key_id", "")
+        private_key = credentials.get("secret_key", "")
+        if not key_id or not private_key:
+            raise ValueError("Kalshi credentials are incomplete; save the API key ID and matching private-key PEM again")
         timestamp = str(int(time.time() * 1000))
-        key = serialization.load_pem_private_key(credentials["secret_key"].encode(), password=None)
+        try:
+            key = serialization.load_pem_private_key(private_key.encode(), password=None)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Kalshi private key is invalid. Paste the complete unencrypted PEM file downloaded from Kalshi, including BEGIN/END lines") from exc
+        if not hasattr(key, "sign"):
+            raise ValueError("Kalshi private key cannot sign requests; save the matching RSA private-key PEM again")
         signature = key.sign(f"{timestamp}{method}{path}".encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-        return {"KALSHI-ACCESS-KEY": credentials["key_id"], "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        return {"KALSHI-ACCESS-KEY": key_id, "KALSHI-ACCESS-TIMESTAMP": timestamp,
                 "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode()}
 
 
@@ -490,7 +507,9 @@ async def book(provider: Literal["kalshi", "polymarket_us"], market_id: str, env
         cred = vault.read(provider)
         return {"book": await adapter(provider).book(market_id, environment, cred), "fetched_at": utc_now()}
     except Exception as exc:
-        raise HTTPException(502, f"order book unavailable: {type(exc).__name__}")
+        safe_detail = str(exc) if isinstance(exc, (ValueError, PermissionError)) else type(exc).__name__
+        event("error", "orderbook_error", f"{provider} {market_id}: {safe_detail}")
+        raise HTTPException(502, f"order book unavailable: {safe_detail}")
 
 
 @app.get("/api/orders")

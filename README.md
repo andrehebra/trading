@@ -54,6 +54,8 @@ Persistent encrypted credentials, orders, fills, and audit logs live in `./data/
 
 The Polymarket adapter uses the official SDK to avoid reimplementing the signed protocol. The Kalshi adapter signs the currently documented V2 REST shape directly. APIs change: run paper mode and test a single demo/API order after an upgrade, and review exchange responses before arming production.
 
+If a Kalshi order book asks for authentication, paste the full **unencrypted PEM private-key file** downloaded with that production API key into Credential Vault—not an API secret string. The app first attempts a public book and will only sign a request when Kalshi returns an authentication challenge.
+
 ### Fees
 
 The bot estimates Polymarket crypto taker fees as `contracts × 0.07 × price × (1 − price)`, rounded to 5 decimals, and estimates maker fees as zero. This follows Polymarket’s current published crypto fee schedule; the exchange remains authoritative at match time. Kalshi’s fee schedule is market/series dependent, so the bot records zero *estimate* for Kalshi rather than inventing a fee. Set a conservative lower spend cap to cover actual fees, and reconcile fills against the exchange before relying on P&L.
