@@ -76,8 +76,8 @@ def setup_db() -> None:
         """)
         defaults = {
           "mode": "paper", "armed": False, "running": False, "kill_switch": False,
-          "provider": "kalshi", "environment": "demo", "threshold": 0.45,
-          "position_dollars": 10, "max_limit": 0.45, "maker_only": False,
+          "provider": "kalshi", "environment": "demo", "min_entry": 0.01,
+          "max_entry": 0.45, "position_dollars": 10, "maker_only": False,
           "daily_cap": 25, "total_cap": 100, "max_open_exposure": 50,
           "stale_seconds": 45,
         }
@@ -152,9 +152,9 @@ class Config(BaseModel):
     provider: Literal["kalshi", "polymarket_us"] = "kalshi"
     environment: Literal["demo", "live"] = "demo"
     mode: Literal["paper", "live"] = "paper"
-    threshold: float = Field(0.45, gt=0.01, lt=0.99)
+    min_entry: float = Field(0.01, gt=0.001, lt=0.99)
+    max_entry: float = Field(0.45, gt=0.001, lt=0.99)
     position_dollars: float = Field(10, gt=0, le=10000)
-    max_limit: float = Field(0.45, gt=0.01, lt=0.99)
     maker_only: bool = False
     daily_cap: float = Field(25, gt=0, le=100000)
     total_cap: float = Field(100, gt=0, le=1000000)
@@ -358,19 +358,25 @@ def duplicate(provider: str, market_id: str, mode: str) -> bool:
         return c.execute("SELECT 1 FROM orders WHERE provider=? AND market_id=? AND outcome='YES' AND mode=? AND status IN ('open','filled')", (provider, market_id, mode)).fetchone() is not None
 
 
+def in_entry_band(observed_ask: float | None, min_entry: float, max_entry: float) -> bool:
+    return observed_ask is not None and min_entry <= observed_ask <= max_entry
+
+
 async def place(market: dict[str, Any], observed_ask: float | None) -> str:
     cfg = settings()
     if cfg["kill_switch"] or not cfg["running"]:
         return "disabled"
-    if observed_ask is None or observed_ask > cfg["threshold"] or observed_ask > cfg["max_limit"]:
+    min_entry = cfg.get("min_entry", 0.01)
+    max_entry = cfg.get("max_entry", cfg.get("max_limit", cfg.get("threshold", 0.45)))
+    if not in_entry_band(observed_ask, min_entry, max_entry):
         return "not eligible"
     if duplicate(cfg["provider"], market["id"], cfg["mode"]):
         return "duplicate blocked"
-    cap = min(cfg["max_limit"], cfg["threshold"])
-    # A maker price rests one tick below the displayed ask instead of crossing it.
-    price = min(cap, round(observed_ask - 0.01, 4)) if cfg["maker_only"] else cap
-    if price <= 0:
-        return "maker price unavailable"
+    # Non-maker orders use the displayed ask as their submitted limit. Maker quotes
+    # rest one tick lower and must still remain inside the configured entry band.
+    price = round(observed_ask - 0.01, 4) if cfg["maker_only"] else observed_ask
+    if price < min_entry or price > max_entry:
+        return "maker price outside entry band"
     quantity = int((Decimal(str(cfg["position_dollars"])) / Decimal(str(price))).to_integral_value(rounding=ROUND_DOWN))
     if quantity < 1:
         return "size too small"
@@ -450,6 +456,8 @@ async def status():
 @app.put("/api/config")
 async def update_config(config: Config):
     values = config.model_dump()
+    if values["min_entry"] > values["max_entry"]:
+        raise HTTPException(400, "Minimum entry price cannot exceed maximum entry price")
     if values["mode"] == "live" and values["environment"] != "live":
         raise HTTPException(400, "Live mode requires the live environment")
     set_settings(values)

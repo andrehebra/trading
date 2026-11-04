@@ -3,7 +3,7 @@ import pytest
 os.environ.setdefault("APP_MASTER_KEY", "h4c9CJZZy_4FMBz9cU1EpuEwPYUUnva7grXAUDFJIpY=")
 os.environ.setdefault("DATABASE_PATH", "/tmp/prediction-market-test.db")
 
-from app.main import KalshiAdapter, fast_kalshi_crypto, fee, normalize_market
+from app.main import KalshiAdapter, fast_kalshi_crypto, fee, in_entry_band, normalize_market
 
 
 def test_polymarket_crypto_taker_fee_formula():
@@ -27,3 +27,10 @@ def test_fast_kalshi_filter_only_accepts_15_minute_crypto_series():
 def test_kalshi_key_error_is_actionable_and_secret_free():
     with pytest.raises(ValueError, match="complete unencrypted PEM"):
         KalshiAdapter._headers("GET", "/trade-api/v2/markets/test/orderbook", {"key_id": "key", "secret_key": "not-a-pem"})
+
+
+def test_entry_band_includes_exact_bounds_only():
+    assert not in_entry_band(0.899, 0.90, 0.98)
+    assert in_entry_band(0.90, 0.90, 0.98)
+    assert in_entry_band(0.98, 0.90, 0.98)
+    assert not in_entry_band(0.981, 0.90, 0.98)
