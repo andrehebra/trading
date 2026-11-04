@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_MASTER_KEY: ${APP_MASTER_KEY:?Set APP_MASTER_KEY in .env before starting}
+      DATABASE_PATH: /app/data/trader.db
+      POLL_SECONDS: ${POLL_SECONDS:-15}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
