@@ -31,7 +31,7 @@ The kill switch halts new automated orders immediately and disarms live mode. It
    docker compose up --build -d
    ```
 
-4. Open [http://localhost:8000](http://localhost:8000). It is intentionally bound to loopback only. Do not expose it to the public Internet without an authenticated reverse proxy and TLS.
+4. On the server itself, open [http://localhost:8000](http://localhost:8000). From another device on your trusted home network, open `http://<server-LAN-IP>:8000` (for example, `http://192.168.1.50:8000`). The included `.env` binds to the LAN by default; set `DASHBOARD_BIND=127.0.0.1` to make it server-only again. Do not expose it to the public Internet without an authenticated reverse proxy and TLS.
 
 5. Use the dashboard in paper mode first. Save API credentials only when you need authenticated order books or live execution. The browser clears the secret form after a successful submission.
 

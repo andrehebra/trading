@@ -2,7 +2,7 @@ services:
   bot:
     build: .
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-8000}:8000"
     environment:
       APP_MASTER_KEY: ${APP_MASTER_KEY:?Set APP_MASTER_KEY in .env before starting}
       DATABASE_PATH: /app/data/trader.db
