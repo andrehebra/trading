@@ -13,4 +13,5 @@ $('#credentialForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/c
 $('#arm').onclick=async()=>{try{await api('/api/arm',{method:'POST',body:JSON.stringify({phrase:$('#armPhrase').value})});toast('Live trading armed');await loadStatus()}catch(e){toast(e.message,true)}};
 $('#start').onclick=async()=>{try{await api('/api/start',{method:'POST'});toast('Automation started');await loadStatus()}catch(e){toast(e.message,true)}};
 $('#kill').onclick=async()=>{await api('/api/kill',{method:'POST'});toast('Kill switch activated',true);await loadStatus()};$('#refresh').onclick=loadMarkets;$('#loadOrders').onclick=loadOrders;
+$('#clearUnconfirmed').onclick=async()=>{try{const d=await api('/api/orders/clear-unconfirmed',{method:'POST',body:JSON.stringify({phrase:$('#clearPhrase').value})});$('#clearPhrase').value='';toast(`${d.cleared} unconfirmed record(s) cleared locally`);await Promise.all([loadStatus(),loadOrders(),loadEvents()])}catch(e){toast(e.message,true)}};
 Promise.all([loadStatus(),loadMarkets(),loadOrders(),loadEvents()]).catch(e=>toast(e.message,true));setInterval(()=>{loadStatus();loadOrders();loadEvents()},10000);

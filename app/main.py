@@ -78,7 +78,7 @@ def setup_db() -> None:
           outcome TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, price REAL NOT NULL,
           quantity INTEGER NOT NULL, estimated_fee REAL NOT NULL, exchange_order_id TEXT,
           client_order_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          error TEXT, UNIQUE(provider, market_id, outcome, mode, status)
+          error TEXT
         );
         CREATE TABLE IF NOT EXISTS fills (
           id TEXT PRIMARY KEY, order_id TEXT NOT NULL, price REAL NOT NULL, quantity INTEGER NOT NULL,
@@ -97,11 +97,35 @@ def setup_db() -> None:
         }
         for key, value in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, json.dumps(value)))
+        migrate_orders_schema(c)
         # A restart may interrupt after the durable pre-submission record but before
         # the exchange response. Never silently retry that client order ID: retain it
         # as an unknown position so it continues to block a duplicate until the window
         # expires or the operator reconciles it at the venue.
         c.execute("UPDATE orders SET status='unknown', error=COALESCE(error, 'Interrupted before exchange acknowledgement; reconcile at venue'), updated_at=? WHERE status='pending'", (utc_now(),))
+
+
+def migrate_orders_schema(conn: sqlite3.Connection) -> None:
+    """Remove the legacy status-inclusive unique key without discarding audit rows."""
+    columns = conn.execute("PRAGMA index_list(orders)").fetchall()
+    # A legacy database has two generated unique indexes: client_order_id plus the
+    # (provider, market_id, outcome, mode, status) constraint. The latter made a
+    # second rejected attempt impossible to transition from pending to error.
+    if len([row for row in columns if row[2]]) < 2:
+        return
+    conn.executescript("""
+        CREATE TABLE orders_rebuilt (
+          id TEXT PRIMARY KEY, provider TEXT NOT NULL, market_id TEXT NOT NULL, event_id TEXT,
+          outcome TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, price REAL NOT NULL,
+          quantity INTEGER NOT NULL, estimated_fee REAL NOT NULL, exchange_order_id TEXT,
+          client_order_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          error TEXT
+        );
+        INSERT INTO orders_rebuilt(id,provider,market_id,event_id,outcome,mode,status,price,quantity,estimated_fee,exchange_order_id,client_order_id,created_at,updated_at,error)
+          SELECT id,provider,market_id,event_id,outcome,mode,status,price,quantity,estimated_fee,exchange_order_id,client_order_id,created_at,updated_at,error FROM orders;
+        DROP TABLE orders;
+        ALTER TABLE orders_rebuilt RENAME TO orders;
+    """)
 
 
 def get_setting(key: str) -> Any:
@@ -182,6 +206,10 @@ class Config(BaseModel):
 
 
 class ArmRequest(BaseModel):
+    phrase: str
+
+
+class ClearUnconfirmedRequest(BaseModel):
     phrase: str
 
 
@@ -277,10 +305,13 @@ class KalshiAdapter:
 
     async def order(self, market: dict[str, Any], outcome: Literal["YES", "NO"], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
         path = "/trade-api/v2/portfolio/events/orders"
-        body = kalshi_order_body(market["id"], outcome, price, quantity, client_order_id)
+        body = kalshi_order_body(market["id"], outcome, price, quantity, client_order_id, maker_only)
         headers = self._headers("POST", path, credentials)
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(KALSHI[environment] + "/portfolio/events/orders", headers=headers, json=body)
+            if response.is_error:
+                detail = response.text[:500].replace("\n", " ")
+                raise RuntimeError(f"Kalshi order rejected ({response.status_code}): {detail}")
             response.raise_for_status()
         return str(response.json().get("order_id", client_order_id))
 
@@ -381,15 +412,16 @@ def fast_kalshi_directional(value: dict[str, Any]) -> bool:
     return series in DIRECTIONAL_KALSHI_SERIES or any(ticker.startswith(prefix + "-") for prefix in DIRECTIONAL_KALSHI_SERIES)
 
 
-def kalshi_order_body(market_id: str, outcome: Literal["YES", "NO"], price: float, quantity: int, client_order_id: str) -> dict[str, Any]:
+def kalshi_order_body(market_id: str, outcome: Literal["YES", "NO"], price: float, quantity: int, client_order_id: str, maker_only: bool = False) -> dict[str, Any]:
     """Translate an intended YES/NO purchase into Kalshi's complementary contract API."""
     # Kalshi's order API buys YES with a bid. A long NO is represented by selling
     # the complementary YES contract, at (1 - NO price), rather than an inverted
     # YES bid. Store and display the user's intended NO price everywhere else.
     side = "bid" if outcome == "YES" else "ask"
     venue_price = price if outcome == "YES" else round(1 - price, 4)
-    return {"ticker": market_id, "client_order_id": client_order_id, "side": side, "count": quantity,
-            "price": f"{venue_price:.4f}", "time_in_force": "good_till_canceled", "self_trade_prevention_type": "taker_at_cross"}
+    return {"ticker": market_id, "client_order_id": client_order_id, "side": side, "count": f"{quantity:.2f}",
+            "price": f"{venue_price:.4f}", "time_in_force": "good_till_canceled", "post_only": maker_only,
+            "self_trade_prevention_type": "taker_at_cross"}
 
 
 def adapter(provider: str):
@@ -594,6 +626,19 @@ async def orders():
     with db() as c:
         rows = c.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100").fetchall()
     return {"orders": [dict(r) for r in rows]}
+
+
+@app.post("/api/orders/clear-unconfirmed")
+async def clear_unconfirmed(value: ClearUnconfirmedRequest):
+    """Release local ghost records only after the operator reconciles the venue."""
+    if value.phrase != "CLEAR UNCONFIRMED ORDERS":
+        raise HTTPException(400, "Enter the exact phrase to clear locally unconfirmed records")
+    with db() as c:
+        result = c.execute("""UPDATE orders
+            SET status='cleared', error=COALESCE(error, 'Cleared locally after operator confirmed no exchange order'), updated_at=?
+            WHERE status IN ('pending','unknown') AND exchange_order_id IS NULL""", (utc_now(),))
+    event("warning", "unconfirmed_orders_cleared", f"{result.rowcount} local records cleared after operator confirmation")
+    return {"ok": True, "cleared": result.rowcount}
 
 
 @app.get("/api/portfolio")
