@@ -17,7 +17,7 @@ from typing import Any, Literal
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -97,6 +97,11 @@ def setup_db() -> None:
         }
         for key, value in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, json.dumps(value)))
+        # A restart may interrupt after the durable pre-submission record but before
+        # the exchange response. Never silently retry that client order ID: retain it
+        # as an unknown position so it continues to block a duplicate until the window
+        # expires or the operator reconciles it at the venue.
+        c.execute("UPDATE orders SET status='unknown', error=COALESCE(error, 'Interrupted before exchange acknowledgement; reconcile at venue'), updated_at=? WHERE status='pending'", (utc_now(),))
 
 
 def get_setting(key: str) -> Any:
@@ -292,9 +297,16 @@ class KalshiAdapter:
             key = serialization.load_pem_private_key(private_key.encode(), password=None)
         except (TypeError, ValueError) as exc:
             raise ValueError("Kalshi private key is invalid. Paste the complete unencrypted PEM file downloaded from Kalshi, including BEGIN/END lines") from exc
-        if not hasattr(key, "sign"):
-            raise ValueError("Kalshi private key cannot sign requests; save the matching RSA private-key PEM again")
-        signature = key.sign(f"{timestamp}{method}{path}".encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+        message = f"{timestamp}{method}{path}".encode()
+        # Kalshi API keys may be RSA or Ed25519. The latter signs the raw payload and
+        # does not accept RSA padding/hash arguments. Supporting both avoids treating
+        # a valid current Ed25519 PEM as a malformed key.
+        if isinstance(key, ed25519.Ed25519PrivateKey):
+            signature = key.sign(message)
+        elif hasattr(key, "sign"):
+            signature = key.sign(message, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+        else:
+            raise ValueError("Kalshi private key cannot sign requests; save the matching RSA or Ed25519 private-key PEM again")
         return {"KALSHI-ACCESS-KEY": key_id, "KALSHI-ACCESS-TIMESTAMP": timestamp,
                 "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode()}
 
@@ -395,19 +407,19 @@ def spend(kind: str) -> float:
     day_clause = "AND substr(created_at,1,10)=?" if kind == "daily" else ""
     args: tuple[Any, ...] = (datetime.now(UTC).date().isoformat(),) if kind == "daily" else ()
     with db() as c:
-        row = c.execute(f"SELECT COALESCE(SUM(price*quantity+estimated_fee),0) AS total FROM orders WHERE status IN ('open','filled') {day_clause}", args).fetchone()
+        row = c.execute(f"SELECT COALESCE(SUM(price*quantity+estimated_fee),0) AS total FROM orders WHERE status IN ('pending','unknown','open','filled') {day_clause}", args).fetchone()
     return float(row["total"])
 
 
 def open_exposure() -> float:
     with db() as c:
-        row = c.execute("SELECT COALESCE(SUM(price*quantity),0) AS total FROM orders WHERE status IN ('open','filled')").fetchone()
+        row = c.execute("SELECT COALESCE(SUM(price*quantity),0) AS total FROM orders WHERE status IN ('pending','unknown','open','filled')").fetchone()
     return float(row["total"])
 
 
 def duplicate(provider: str, market_id: str, outcome: Literal["YES", "NO"], mode: str) -> bool:
     with db() as c:
-        return c.execute("SELECT 1 FROM orders WHERE provider=? AND market_id=? AND outcome=? AND mode=? AND status IN ('open','filled')", (provider, market_id, outcome, mode)).fetchone() is not None
+        return c.execute("SELECT 1 FROM orders WHERE provider=? AND market_id=? AND outcome=? AND mode=? AND status IN ('pending','unknown','open','filled')", (provider, market_id, outcome, mode)).fetchone() is not None
 
 
 def in_entry_band(observed_ask: float | None, min_entry: float, max_entry: float) -> bool:
@@ -463,7 +475,9 @@ async def place(market: dict[str, Any], outcome: Literal["YES", "NO"], observed_
     except Exception as exc:
         with db() as c:
             c.execute("UPDATE orders SET status='error',error=?,updated_at=? WHERE id=?", (str(exc)[:500], utc_now(), oid))
-        event("error", "order_error", f"{market['id']}: {type(exc).__name__}")
+        # Error text is useful for diagnosis, but credentials and signed payloads are
+        # intentionally never included in exception messages constructed by this app.
+        event("error", "order_error", f"{market['id']} {outcome}: {type(exc).__name__}: {str(exc)[:300]}")
         return "error"
 
 
@@ -586,7 +600,7 @@ async def orders():
 async def portfolio():
     """Mark each bot-owned YES/NO position to its newest visible outcome bid."""
     with db() as c:
-        rows = [dict(r) for r in c.execute("SELECT * FROM orders WHERE status IN ('open','filled') ORDER BY created_at DESC").fetchall()]
+        rows = [dict(r) for r in c.execute("SELECT * FROM orders WHERE status IN ('pending','unknown','open','filled') ORDER BY created_at DESC").fetchall()]
     cfg = settings()
     marks: dict[tuple[str, str, str], float | None] = {}
     failures: list[str] = []

@@ -49,10 +49,12 @@ Persistent encrypted credentials, orders, fills, and audit logs live in `./data/
 
 | Venue | Market data | Live authentication and order path | Test environment |
 | --- | --- | --- | --- |
-| Kalshi | Most market-list calls are public; order book may require credentials. | RSA-PSS request signature with key ID + downloaded PEM. V2 order writes go to `/portfolio/events/orders` and require a client order ID for idempotency. | Separate demo account/keys at `demo.kalshi.co`; demo base: `https://demo-api.kalshi.co/trade-api/v2`. |
+| Kalshi | Most market-list calls are public; order book may require credentials. | The downloaded PEM is signed with its matching RSA-PSS **or Ed25519** algorithm, with key ID. V2 order writes go to `/portfolio/events/orders` and require a client order ID for idempotency. | Separate demo account/keys at `demo.kalshi.co`; demo base: `https://demo-api.kalshi.co/trade-api/v2`. |
 | Polymarket US | Public market and book methods are exposed in the official `polymarket-us` SDK. | Ed25519 API credentials; the adapter creates a limit buy using `ORDER_INTENT_BUY_LONG` for YES and `ORDER_INTENT_BUY_SHORT` for NO. API access requires application, integration testing, and approval. | The official developer page says qualification includes sandbox integration testing; its public SDK does not document a general self-serve sandbox base URL, so this adapter uses paper mode until approved credentials/access are provided. |
 
 The Polymarket adapter uses the official SDK to avoid reimplementing the signed protocol. The Kalshi adapter signs the currently documented V2 REST shape directly. APIs change: run paper mode and test a single demo/API order after an upgrade, and review exchange responses before arming production.
+
+If the app restarts after it has created a durable `pending` order record but before it receives an exchange response, it changes that record to `unknown` on the next start. The bot treats it as potential exposure and will not retry the same market/outcome automatically. Reconcile that client order ID in Kalshi before manually clearing or changing it; this avoids a restart creating an accidental duplicate live position.
 
 If a Kalshi order book asks for authentication, paste the full **unencrypted PEM private-key file** downloaded with that production API key into Credential Vault—not an API secret string. The app first attempts a public book and will only sign a request when Kalshi returns an authentication challenge.
 

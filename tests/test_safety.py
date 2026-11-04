@@ -1,5 +1,8 @@
 import os
+import base64
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 os.environ.setdefault("APP_MASTER_KEY", "h4c9CJZZy_4FMBz9cU1EpuEwPYUUnva7grXAUDFJIpY=")
 os.environ.setdefault("DATABASE_PATH", "/tmp/prediction-market-test.db")
 
@@ -42,6 +45,15 @@ def test_kalshi_no_order_uses_complementary_yes_ask():
 def test_kalshi_key_error_is_actionable_and_secret_free():
     with pytest.raises(ValueError, match="complete unencrypted PEM"):
         KalshiAdapter._headers("GET", "/trade-api/v2/markets/test/orderbook", {"key_id": "key", "secret_key": "not-a-pem"})
+
+
+def test_kalshi_ed25519_pem_signs_the_raw_authentication_payload():
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    pem = private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    path = "/trade-api/v2/portfolio/events/orders"
+    headers = KalshiAdapter._headers("POST", path, {"key_id": "key-id", "secret_key": pem})
+    payload = f"{headers['KALSHI-ACCESS-TIMESTAMP']}POST{path}".encode()
+    private_key.public_key().verify(base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"]), payload)
 
 
 def test_entry_band_includes_exact_bounds_only():
