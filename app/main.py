@@ -315,6 +315,23 @@ class KalshiAdapter:
             response.raise_for_status()
         return str(response.json().get("order_id", client_order_id))
 
+    async def order_state(self, order_id: str, credentials: dict[str, str], environment: str) -> dict[str, Any]:
+        """Read the exchange lifecycle state for an already accepted live order."""
+        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(KALSHI[environment] + f"/portfolio/orders/{order_id}", headers=self._headers("GET", path, credentials))
+            response.raise_for_status()
+        payload = response.json()
+        return payload.get("order", payload)
+
+    async def positions(self, credentials: dict[str, str], environment: str) -> list[dict[str, Any]]:
+        path = "/trade-api/v2/portfolio/positions"
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(KALSHI[environment] + "/portfolio/positions", headers=self._headers("GET", path, credentials))
+            response.raise_for_status()
+        payload = response.json()
+        return payload.get("market_positions", payload.get("positions", []))
+
     @staticmethod
     def _headers(method: str, path: str, credentials: dict[str, str] | None) -> dict[str, str]:
         if not credentials:
@@ -443,7 +460,14 @@ def spend(kind: str) -> float:
     return float(row["total"])
 
 
-def open_exposure() -> float:
+def position_exposure() -> float:
+    with db() as c:
+        row = c.execute("SELECT COALESCE(SUM(price*quantity),0) AS total FROM orders WHERE status='filled'").fetchone()
+    return float(row["total"])
+
+
+def reserved_exposure() -> float:
+    """Worst-case spend if every unresolved bot order fills."""
     with db() as c:
         row = c.execute("SELECT COALESCE(SUM(price*quantity),0) AS total FROM orders WHERE status IN ('pending','unknown','open','filled')").fetchone()
     return float(row["total"])
@@ -478,7 +502,7 @@ async def place(market: dict[str, Any], outcome: Literal["YES", "NO"], observed_
         return "size too small"
     estimated_fee = fee(cfg["provider"], quantity, price, cfg["maker_only"])
     total = quantity * price + estimated_fee
-    if spend("daily") + total > cfg["daily_cap"] or spend("total") + total > cfg["total_cap"] or open_exposure() + quantity * price > cfg["max_open_exposure"]:
+    if spend("daily") + total > cfg["daily_cap"] or spend("total") + total > cfg["total_cap"] or reserved_exposure() + quantity * price > cfg["max_open_exposure"]:
         event("warning", "risk_cap_block", f"{market['id']} blocked by cap")
         return "risk cap blocked"
     oid, coid = str(uuid.uuid4()), str(uuid.uuid4())
@@ -513,11 +537,60 @@ async def place(market: dict[str, Any], outcome: Literal["YES", "NO"], observed_
         return "error"
 
 
+async def reconcile_kalshi_orders(cfg: dict[str, Any]) -> None:
+    """Synchronize bot-owned accepted orders before using them in exposure decisions."""
+    if cfg["provider"] != "kalshi":
+        return
+    credentials = vault.read("kalshi")
+    if not credentials:
+        event("warning", "reconciliation_skipped", "Kalshi credentials unavailable")
+        return
+    with db() as c:
+        rows = [dict(row) for row in c.execute("""SELECT id,exchange_order_id,status,market_id
+            FROM orders WHERE provider='kalshi' AND mode='live' AND status IN ('open','filled')
+            AND exchange_order_id IS NOT NULL""").fetchall()]
+    if not rows:
+        return
+    venue = KalshiAdapter()
+    terminal: dict[str, str] = {"canceled": "cancelled", "executed": "filled"}
+    for row in rows:
+        try:
+            exchange_order = await venue.order_state(row["exchange_order_id"], credentials, cfg["environment"])
+            state = str(exchange_order.get("status", "")).lower()
+            next_status = terminal.get(state, "open" if state in {"resting", "pending"} else None)
+            if next_status and next_status != row["status"]:
+                with db() as c:
+                    c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?", (next_status, utc_now(), row["id"]))
+                event("info", "order_reconciled", f"{row['market_id']} {state}")
+        except Exception as exc:
+            # Retain the previous conservative state if Kalshi cannot be checked.
+            event("warning", "reconciliation_error", f"{row['market_id']}: {type(exc).__name__}")
+    with db() as c:
+        filled_rows = [dict(row) for row in c.execute("SELECT id,market_id FROM orders WHERE provider='kalshi' AND mode='live' AND status='filled'").fetchall()]
+    if not filled_rows:
+        return
+    try:
+        positions = await venue.positions(credentials, cfg["environment"])
+        active_tickers = {
+            str(position.get("ticker", "")) for position in positions
+            if abs(number(position.get("position_fp", position.get("position"))) or 0) > 0
+        }
+        for row in filled_rows:
+            if row["market_id"] not in active_tickers:
+                with db() as c:
+                    c.execute("UPDATE orders SET status='settled',updated_at=? WHERE id=?", (utc_now(), row["id"]))
+                event("info", "position_reconciled", f"{row['market_id']} no longer open at Kalshi")
+    except Exception as exc:
+        event("warning", "position_reconciliation_error", type(exc).__name__)
+
+
 async def worker() -> None:
     while True:
         try:
             cfg = settings()
             if cfg["running"] and not cfg["kill_switch"]:
+                if cfg["mode"] == "live":
+                    await reconcile_kalshi_orders(cfg)
                 markets = await adapter(cfg["provider"]).markets(cfg["environment"])
                 for market in markets[:100]:
                     # Market listing BBO is time-stamped by this poll; never use stale cached data.
@@ -551,7 +624,7 @@ async def home(): return FileResponse(Path(__file__).parent / "static" / "index.
 @app.get("/api/status")
 async def status():
     cfg = settings()
-    return {"config": cfg, "credentials": vault.configured(), "daily_spend": spend("daily"), "total_spend": spend("total"), "open_exposure": open_exposure(), "poll_seconds": POLL_SECONDS}
+    return {"config": cfg, "credentials": vault.configured(), "daily_spend": spend("daily"), "total_spend": spend("total"), "open_exposure": position_exposure(), "reserved_exposure": reserved_exposure(), "poll_seconds": POLL_SECONDS}
 
 
 @app.put("/api/config")
@@ -645,7 +718,7 @@ async def clear_unconfirmed(value: ClearUnconfirmedRequest):
 async def portfolio():
     """Mark each bot-owned YES/NO position to its newest visible outcome bid."""
     with db() as c:
-        rows = [dict(r) for r in c.execute("SELECT * FROM orders WHERE status IN ('pending','unknown','open','filled') ORDER BY created_at DESC").fetchall()]
+        rows = [dict(r) for r in c.execute("SELECT * FROM orders WHERE status='filled' ORDER BY created_at DESC").fetchall()]
     cfg = settings()
     marks: dict[tuple[str, str, str], float | None] = {}
     failures: list[str] = []
