@@ -33,13 +33,27 @@ KALSHI = {
 }
 POLYMARKET_US = "https://api.polymarket.us"
 CRYPTO_TERMS = ("bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "dogecoin", "doge", "xrp")
-FAST_KALSHI_SERIES = {
+# These are deliberately exact Kalshi series identifiers. Fetching each series directly
+# keeps the dashboard limited to short-duration direction contracts instead of matching
+# unrelated commodity or crypto markets by title.
+DIRECTIONAL_KALSHI_SERIES = {
     "KXBTC15M": "Bitcoin",
     "KXETH15M": "Ethereum",
     "KXSOL15M": "Solana",
     "KXXRP15M": "XRP",
     "KXDOGE15M": "Dogecoin",
+    "KXGOLD15M": "Gold",
+    "KXSILVER15M": "Silver",
+    "KXPLATINUM15M": "Platinum",
+    "KXPALLADIUM15M": "Palladium",
+    "KXCOPPER15M": "Copper",
+    "KXWTI15M": "WTI oil",
+    "KXNATGAS15M": "Natural gas",
+    "KXBRENT15M": "Brent crude",
 }
+FAST_KALSHI_SERIES = {key: value for key, value in DIRECTIONAL_KALSHI_SERIES.items() if key in {
+    "KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M",
+}}
 
 
 def utc_now() -> str:
@@ -171,21 +185,34 @@ def normalize_market(provider: str, raw: dict[str, Any]) -> dict[str, Any]:
         ticker = raw.get("ticker", "")
         series = raw.get("series_ticker", "")
         label = raw.get("title") or raw.get("subtitle") or ticker
-        if series in FAST_KALSHI_SERIES or any(ticker.startswith(value) for value in FAST_KALSHI_SERIES):
-            asset = FAST_KALSHI_SERIES.get(series) or next(name for key, name in FAST_KALSHI_SERIES.items() if ticker.startswith(key))
+        if series in DIRECTIONAL_KALSHI_SERIES or any(ticker.startswith(value) for value in DIRECTIONAL_KALSHI_SERIES):
+            asset = DIRECTIONAL_KALSHI_SERIES.get(series) or next(name for key, name in DIRECTIONAL_KALSHI_SERIES.items() if ticker.startswith(key))
             label = f"{asset} — Up or Down · 15-minute window"
+        yes_bid = cents(first_value(raw, "yes_bid", "yes_bid_dollars"))
+        yes_ask = cents(first_value(raw, "yes_ask", "yes_ask_dollars"))
+        no_bid = cents(first_value(raw, "no_bid", "no_bid_dollars"))
+        no_ask = cents(first_value(raw, "no_ask", "no_ask_dollars"))
+        # Kalshi represents NO as the complementary YES contract. Some list responses
+        # omit NO BBO fields, so derive them only from the contemporaneous YES BBO.
+        if no_bid is None and yes_ask is not None:
+            no_bid = round(1 - yes_ask, 4)
+        if no_ask is None and yes_bid is not None:
+            no_ask = round(1 - yes_bid, 4)
         return {
             "provider": provider, "id": ticker, "event_id": raw.get("event_ticker", ""),
             "title": label,
             "close_time": raw.get("close_time") or raw.get("expiration_time"),
-            "yes_bid": cents(raw.get("yes_bid") or raw.get("yes_bid_dollars")),
-            "yes_ask": cents(raw.get("yes_ask") or raw.get("yes_ask_dollars")), "raw": raw,
+            "yes_bid": yes_bid, "yes_ask": yes_ask, "no_bid": no_bid, "no_ask": no_ask, "raw": raw,
         }
+    yes_bid = number(first_value(raw, "bestBid", "yesBid"))
+    yes_ask = number(first_value(raw, "bestAsk", "yesAsk"))
+    no_bid = number(first_value(raw, "bestNoBid", "noBid"))
+    no_ask = number(first_value(raw, "bestNoAsk", "noAsk"))
     return {
         "provider": provider, "id": raw.get("slug") or str(raw.get("id", "")), "event_id": str(raw.get("eventId", "")),
         "title": raw.get("title") or raw.get("question") or raw.get("slug", ""),
         "close_time": raw.get("closeTime") or raw.get("endDate"),
-        "yes_bid": number(raw.get("bestBid")), "yes_ask": number(raw.get("bestAsk")), "raw": raw,
+        "yes_bid": yes_bid, "yes_ask": yes_ask, "no_bid": no_bid, "no_ask": no_ask, "raw": raw,
     }
 
 
@@ -198,6 +225,14 @@ def number(value: Any) -> float | None:
         return None
 
 
+def first_value(values: dict[str, Any], *keys: str) -> Any:
+    """Return the first field that exists, preserving valid zero-price quotes."""
+    for key in keys:
+        if key in values and values[key] is not None and values[key] != "":
+            return values[key]
+    return None
+
+
 def cents(value: Any) -> float | None:
     val = number(value)
     return None if val is None else (val / 100 if val > 1 else val)
@@ -208,7 +243,7 @@ class KalshiAdapter:
 
     async def markets(self, environment: str) -> list[dict[str, Any]]:
         async with httpx.AsyncClient(timeout=12) as client:
-            requests = [client.get(f"{KALSHI[environment]}/markets", params={"status": "open", "limit": 20, "series_ticker": series}) for series in FAST_KALSHI_SERIES]
+            requests = [client.get(f"{KALSHI[environment]}/markets", params={"status": "open", "limit": 20, "series_ticker": series}) for series in DIRECTIONAL_KALSHI_SERIES]
             responses = await asyncio.gather(*requests)
             for response in responses:
                 response.raise_for_status()
@@ -216,7 +251,7 @@ class KalshiAdapter:
         # Direct series requests are authoritative. The guard also handles an API response
         # that omits series_ticker while retaining its complete market ticker.
         return sorted(
-            [normalize_market(self.provider, value) for value in values if fast_kalshi_crypto(value)],
+            [normalize_market(self.provider, value) for value in values if fast_kalshi_directional(value)],
             key=lambda market: market.get("close_time") or "",
         )
 
@@ -235,10 +270,9 @@ class KalshiAdapter:
             response.raise_for_status()
             return response.json().get("orderbook", response.json())
 
-    async def order(self, market: dict[str, Any], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
+    async def order(self, market: dict[str, Any], outcome: Literal["YES", "NO"], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
         path = "/trade-api/v2/portfolio/events/orders"
-        body = {"ticker": market["id"], "client_order_id": client_order_id, "side": "bid", "count": quantity,
-                "price": f"{price:.4f}", "time_in_force": "good_till_canceled", "self_trade_prevention_type": "taker_at_cross"}
+        body = kalshi_order_body(market["id"], outcome, price, quantity, client_order_id)
         headers = self._headers("POST", path, credentials)
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(KALSHI[environment] + "/portfolio/events/orders", headers=headers, json=body)
@@ -301,10 +335,11 @@ class PolymarketUSAdapter:
         finally:
             client.close()
 
-    async def order(self, market: dict[str, Any], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
+    async def order(self, market: dict[str, Any], outcome: Literal["YES", "NO"], price: float, quantity: int, credentials: dict[str, str], environment: str, client_order_id: str, maker_only: bool) -> str:
         from polymarket_us import PolymarketUS
         client = PolymarketUS(key_id=credentials["key_id"], secret_key=credentials["secret_key"], timeout=15, max_retries=0)
-        body = {"marketSlug": market["id"], "intent": "ORDER_INTENT_BUY_LONG", "type": "ORDER_TYPE_LIMIT",
+        intent = "ORDER_INTENT_BUY_LONG" if outcome == "YES" else "ORDER_INTENT_BUY_SHORT"
+        body = {"marketSlug": market["id"], "intent": intent, "type": "ORDER_TYPE_LIMIT",
                 "price": {"value": f"{price:.4f}", "currency": "USD"}, "quantity": quantity,
                 "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL", "participateDontInitiate": maker_only}
         try:
@@ -326,6 +361,23 @@ def fast_kalshi_crypto(value: dict[str, Any]) -> bool:
     ticker = str(value.get("ticker", "")).upper()
     series = str(value.get("series_ticker", "")).upper()
     return series in FAST_KALSHI_SERIES or any(ticker.startswith(prefix + "-") for prefix in FAST_KALSHI_SERIES)
+
+
+def fast_kalshi_directional(value: dict[str, Any]) -> bool:
+    ticker = str(value.get("ticker", "")).upper()
+    series = str(value.get("series_ticker", "")).upper()
+    return series in DIRECTIONAL_KALSHI_SERIES or any(ticker.startswith(prefix + "-") for prefix in DIRECTIONAL_KALSHI_SERIES)
+
+
+def kalshi_order_body(market_id: str, outcome: Literal["YES", "NO"], price: float, quantity: int, client_order_id: str) -> dict[str, Any]:
+    """Translate an intended YES/NO purchase into Kalshi's complementary contract API."""
+    # Kalshi's order API buys YES with a bid. A long NO is represented by selling
+    # the complementary YES contract, at (1 - NO price), rather than an inverted
+    # YES bid. Store and display the user's intended NO price everywhere else.
+    side = "bid" if outcome == "YES" else "ask"
+    venue_price = price if outcome == "YES" else round(1 - price, 4)
+    return {"ticker": market_id, "client_order_id": client_order_id, "side": side, "count": quantity,
+            "price": f"{venue_price:.4f}", "time_in_force": "good_till_canceled", "self_trade_prevention_type": "taker_at_cross"}
 
 
 def adapter(provider: str):
@@ -353,16 +405,16 @@ def open_exposure() -> float:
     return float(row["total"])
 
 
-def duplicate(provider: str, market_id: str, mode: str) -> bool:
+def duplicate(provider: str, market_id: str, outcome: Literal["YES", "NO"], mode: str) -> bool:
     with db() as c:
-        return c.execute("SELECT 1 FROM orders WHERE provider=? AND market_id=? AND outcome='YES' AND mode=? AND status IN ('open','filled')", (provider, market_id, mode)).fetchone() is not None
+        return c.execute("SELECT 1 FROM orders WHERE provider=? AND market_id=? AND outcome=? AND mode=? AND status IN ('open','filled')", (provider, market_id, outcome, mode)).fetchone() is not None
 
 
 def in_entry_band(observed_ask: float | None, min_entry: float, max_entry: float) -> bool:
     return observed_ask is not None and min_entry <= observed_ask <= max_entry
 
 
-async def place(market: dict[str, Any], observed_ask: float | None) -> str:
+async def place(market: dict[str, Any], outcome: Literal["YES", "NO"], observed_ask: float | None) -> str:
     cfg = settings()
     if cfg["kill_switch"] or not cfg["running"]:
         return "disabled"
@@ -370,10 +422,10 @@ async def place(market: dict[str, Any], observed_ask: float | None) -> str:
     max_entry = cfg.get("max_entry", cfg.get("max_limit", cfg.get("threshold", 0.45)))
     if not in_entry_band(observed_ask, min_entry, max_entry):
         return "not eligible"
-    if duplicate(cfg["provider"], market["id"], cfg["mode"]):
+    if duplicate(cfg["provider"], market["id"], outcome, cfg["mode"]):
         return "duplicate blocked"
-    # Non-maker orders use the displayed ask as their submitted limit. Maker quotes
-    # rest one tick lower and must still remain inside the configured entry band.
+    # Prices are always the selected outcome's cost. Non-maker orders use the displayed
+    # ask; maker quotes rest one tick lower and must remain inside the entry band.
     price = round(observed_ask - 0.01, 4) if cfg["maker_only"] else observed_ask
     if price < min_entry or price > max_entry:
         return "maker price outside entry band"
@@ -389,13 +441,13 @@ async def place(market: dict[str, Any], observed_ask: float | None) -> str:
     now = utc_now()
     with db() as c:
         c.execute("INSERT INTO orders(id,provider,market_id,event_id,outcome,mode,status,price,quantity,estimated_fee,client_order_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (oid, cfg["provider"], market["id"], market.get("event_id"), "YES", cfg["mode"], "pending", price, quantity, estimated_fee, coid, now, now))
+                  (oid, cfg["provider"], market["id"], market.get("event_id"), outcome, cfg["mode"], "pending", price, quantity, estimated_fee, coid, now, now))
     try:
         if cfg["mode"] == "live":
             cred = vault.read(cfg["provider"])
             if not cred:
                 raise RuntimeError("no credentials for selected provider")
-            exchange_id = await adapter(cfg["provider"]).order(market, price, quantity, cred, cfg["environment"], coid, cfg["maker_only"])
+            exchange_id = await adapter(cfg["provider"]).order(market, outcome, price, quantity, cred, cfg["environment"], coid, cfg["maker_only"])
             status = "open"
         else:
             exchange_id = f"paper-{oid[:8]}"
@@ -406,7 +458,7 @@ async def place(market: dict[str, Any], observed_ask: float | None) -> str:
                     c.execute("INSERT INTO fills(id,order_id,price,quantity,fee,created_at) VALUES (?,?,?,?,?,?)", (str(uuid.uuid4()), oid, observed_ask, quantity, fee(cfg["provider"], quantity, observed_ask, False), now))
         with db() as c:
             c.execute("UPDATE orders SET status=?,exchange_order_id=?,updated_at=? WHERE id=?", (status, exchange_id, utc_now(), oid))
-        event("info", "order_placed", f"{cfg['mode']} {cfg['provider']} {market['id']} x{quantity}")
+        event("info", "order_placed", f"{cfg['mode']} {cfg['provider']} {market['id']} {outcome} x{quantity}")
         return "placed"
     except Exception as exc:
         with db() as c:
@@ -423,7 +475,10 @@ async def worker() -> None:
                 markets = await adapter(cfg["provider"]).markets(cfg["environment"])
                 for market in markets[:100]:
                     # Market listing BBO is time-stamped by this poll; never use stale cached data.
-                    await place(market, market.get("yes_ask"))
+                    # Each outcome has its own contemporary ask, duplicate key, position
+                    # record, sizing, and cap check. One outcome never blocks the other.
+                    await place(market, "YES", market.get("yes_ask"))
+                    await place(market, "NO", market.get("no_ask"))
         except Exception as exc:
             event("error", "poll_error", type(exc).__name__)
         await asyncio.sleep(POLL_SECONDS)
@@ -529,11 +584,11 @@ async def orders():
 
 @app.get("/api/portfolio")
 async def portfolio():
-    """Mark bot-owned positions to the newest visible YES bid; never use a cached mark."""
+    """Mark each bot-owned YES/NO position to its newest visible outcome bid."""
     with db() as c:
         rows = [dict(r) for r in c.execute("SELECT * FROM orders WHERE status IN ('open','filled') ORDER BY created_at DESC").fetchall()]
     cfg = settings()
-    marks: dict[tuple[str, str], float | None] = {}
+    marks: dict[tuple[str, str, str], float | None] = {}
     failures: list[str] = []
     providers = {row["provider"] for row in rows}
     for provider in providers:
@@ -542,19 +597,20 @@ async def portfolio():
             by_id = {market["id"]: market for market in listed}
             for row in rows:
                 if row["provider"] == provider:
-                    marks[(provider, row["market_id"])] = by_id.get(row["market_id"], {}).get("yes_bid")
+                    mark_field = "yes_bid" if row["outcome"] == "YES" else "no_bid"
+                    marks[(provider, row["market_id"], row["outcome"])] = by_id.get(row["market_id"], {}).get(mark_field)
         except Exception:
             failures.append(provider)
     total_cost = total_mark = total_fees = 0.0
     positions = []
     for row in rows:
         cost = row["price"] * row["quantity"]
-        mark = marks.get((row["provider"], row["market_id"]))
+        mark = marks.get((row["provider"], row["market_id"], row["outcome"]))
         total_cost += cost
         total_fees += row["estimated_fee"]
         if mark is not None:
             total_mark += mark * row["quantity"]
-        positions.append({"provider": row["provider"], "market_id": row["market_id"], "quantity": row["quantity"], "cost_basis": cost, "mark": mark,
+        positions.append({"provider": row["provider"], "market_id": row["market_id"], "outcome": row["outcome"], "quantity": row["quantity"], "cost_basis": cost, "mark": mark,
                           "unrealized_pnl": None if mark is None else round(mark * row["quantity"] - cost - row["estimated_fee"], 4)})
     return {"positions": positions, "cost_basis": round(total_cost, 4), "marked_value": round(total_mark, 4), "estimated_fees": round(total_fees, 4),
             "unrealized_pnl": None if failures else round(total_mark - total_cost - total_fees, 4), "mark_failures": failures}
